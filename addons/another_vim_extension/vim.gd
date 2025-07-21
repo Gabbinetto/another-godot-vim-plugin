@@ -90,6 +90,7 @@ func check_editors() -> void:
 				control.visibility_changed.connect(check_editors.call_deferred)
 	if current_editor:
 		current_editor.set_process(false)
+		current_editor.set_process_input(false)
 		current_editor = null
 	var editor_base: ScriptEditorBase = script_editor.get_current_editor()
 	if not editor_base:
@@ -97,6 +98,7 @@ func check_editors() -> void:
 	current_editor = editor_base.get_base_editor()
 	if current_editor:
 		current_editor.set_process(true)
+		current_editor.set_process_input(true)
 
 
 func destroy_editors() -> void:
@@ -104,4 +106,6 @@ func destroy_editors() -> void:
 		var control: Control = editor.get_base_editor()
 		if VimEditor.instance_has(control):
 			control.destroy()
+			control.set_process(false)
+			control.set_process_input(false)
 			control.set_script(null)
