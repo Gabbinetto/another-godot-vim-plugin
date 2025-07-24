@@ -10,6 +10,11 @@ enum {
 	MODE_VISUAL_MASK = 		MODE_VISUAL | MODE_VISUAL_BLOCK
 }
 
+enum {
+	COMMAND_NORMAL,
+	COMMAND_MOTION,
+}
+
 const VimEditor: GDScript = preload("res://addons/another_vim_extension/vim_editor.gd")
 const Vim: GDScript = preload("res://addons/another_vim_extension/vim.gd")
 const MODE_NAMES: Dictionary[int, String] = {
@@ -21,7 +26,7 @@ const MODE_NAMES: Dictionary[int, String] = {
 }
 
 static var regs: Dictionary[String, String] = {
-	
+
 }
 
 var toaster: EditorToaster
@@ -31,9 +36,14 @@ var mode: int = MODE_NORMAL:
 		mode = value
 		vim.command_line.placeholder_text = MODE_NAMES.get(mode, "")
 var actions: Actions = Actions.new(self)
+var parsers: Dictionary[int, Parser] = {
+	MODE_NORMAL: ParserNormal.new(self),
+}
 
+var command_buffer: Array[InputEventKey]
+var last_command: Array[InputEventKey]
 var _visual_mode_start: Vector2 = Vector2.ZERO
-var _last_command: String
+
 
 # Shorthands
 var column: int:
@@ -75,7 +85,6 @@ func _process(delta: float) -> void:
 		set_selection_origin_column(_visual_mode_start.x)
 		if mode == MODE_VISUAL_BLOCK:
 			var dest_column: int = get_line(line).length() if _visual_mode_start.y <= line else 0
-			print(dest_column)
 			select.call_deferred(
 				_visual_mode_start.y, _visual_mode_start.x,
 				line, dest_column
@@ -126,6 +135,9 @@ func _input_pressed(key: InputEventKey) -> void:
 		KEY_DOWN:
 			actions.move_line(1)
 			accept_event()
+	var parser: Parser = parsers.get(mode)
+	if parser:
+		process_command(parser.feed(key), parser)
 
 
 func _input_released(key: InputEventKey) -> void:
@@ -181,12 +193,15 @@ func set_caret(block: bool) -> void:
 		).x
 
 		add_theme_constant_override("caret_width", width)
+		add_theme_color_override("caret_color", Color8(255, 255, 255, 128))
 	else:
 		remove_theme_constant_override("caret_width")
+		remove_theme_color_override("caret_color")
 
 
 func is_visual() -> bool:
 	return bool(mode & MODE_VISUAL_MASK)
+
 
 func set_visual_origin() -> void:
 	if not is_visual():
@@ -198,15 +213,142 @@ func set_visual_origin() -> void:
 		_visual_mode_start = Vector2(0, line)
 
 
+func process_command(command: Dictionary[String, Variant], parser: Parser) -> void:
+	if command.get("reset", false):
+		parser.reset()
+		vim.input_line.text = ""
+	vim.input_line.text += command.get("char", "")
+	
+	if not command.get("completed", false):
+		return
+	
+	parser.process_command(command)
 
-class Actions:
+
+class Parser:
+	enum {
+		START,
+		COUNT_BEFORE,
+		COUNT_AFTER,
+	}
+	
+	const OPERATORS: Array[String] = ["c", "d", "y", ">", "<", "J", "g"]
+	const MOTIONS: Array[String] = ["w", "W", "e", "E", "b", "B", "$", "0", "h", "j", "k", "l", "H", "K", "L"]
+	
+	var operators: Dictionary[String, Callable]
+	var motions: Dictionary[String, Callable]
+	
 	var ed: VimEditor
+	var actions: Actions:
+		get: return ed.actions
+	var status: int
+	var operator: String
+	var count: int = 1
+	var motion: String
 	
 	func _init(editor: VimEditor) -> void:
 		ed = editor
+
+	func reset() -> void:
+		status = START
+		operator = ""
+		count = 1
+		motion = ""
+
+	func feed(key: InputEventKey) -> Dictionary[String, Variant]:
+		if key.keycode == KEY_ESCAPE:
+			return { "reset": true }
+		
+		var char: String = OS.get_keycode_string(key.keycode)
+		if not key.shift_pressed:
+			char = char.to_lower()
+		
+		if status == START:
+			if char.is_valid_int() and char != "0":
+				count = int(char)
+				status = COUNT_BEFORE
+				return { "pending": true, "char": char }
+			elif char in MOTIONS:
+				motion = char
+				return { "completed": true, "motion": motion, "operator": "", "count": count, "reset": true }
+			elif char in OPERATORS:
+				pass
+		elif status == COUNT_BEFORE:
+			if char.is_valid_int():
+				count = count * 10 + int(char)
+				return { "pending": true, "char": char }
+			elif char in MOTIONS:
+				motion = char
+				status = START
+				return { "completed": true, "motion": motion, "operator": "", "count": count, "reset": true }
 	
+		return { "reset": true }
+	
+	func process_command(command: Dictionary[String, Variant]) -> void:
+		if command.get("motion") and not command.get("operator"):
+			for i: int in command.get("count", 1):
+				var fun: Callable = motions.get(command.motion, Callable())
+				fun.call()
+
+
+class ParserNormal extends Parser:
+	func _init(ed: VimEditor) -> void:
+		super(ed)
+		motions = {
+			"h": actions.move_column.bind(-1),
+			"l": actions.move_column.bind(1),
+			"j": actions.move_line.bind(1),
+			"k": actions.move_line.bind(-1),
+			"e": actions.move_to_word_end.bind(false),
+			"E": actions.move_to_word_end.bind(true),
+		}
+
+
+class Actions:
+	var ed: VimEditor
+
+	func _init(editor: VimEditor) -> void:
+		ed = editor
+
+
+	func _pos_is_eof(position: Vector2) -> bool:
+		return position.y >= ed.get_line_count() and position.x >= ed.get_line(ed.get_line_count() - 1).length() 
+
+
+	func _offset_position(position: Vector2, amount: int) -> Vector2:
+		position.x += amount
+		var line: String = ed.get_line(position.y)
+		if position.x >= line.length():
+			position.x -= line.length()
+			position.y += 1
+		elif position.x < 0:
+			position.y -= 1
+			position.x = ed.get_line(position.y).length() + position.x
+
+		return position
+
+
+	func _is_char_word(char: String, big: bool = false) -> bool:
+		if big:
+			return not (char in [" ", "\n", "\t"])
+		else:
+			return (char.to_lower() >= "a" and char.to_lower() <= "z") or char.is_valid_int() or char == "_"
+
+
 	func move_column(amount: int) -> void:
 		ed.column = ed.column + amount
 
+
 	func move_line(amount: int) -> void:
 		ed.line = ed.line + amount
+
+
+	func move_to_word_end(big_word: bool) -> void:
+		var pos: Vector2 = get_word_end(big_word)
+		ed.line = pos.y
+		ed.column = pos.x
+
+
+	func get_word_end(big_word: bool, position: Vector2 = Vector2(ed.column, ed.line)) -> Vector2:
+		# TODO
+		return position
